@@ -416,6 +416,7 @@ static bool append_catalog_item(cloud_store_item_t **items, int *count, int *cap
 }
 
 static void copy_script_permissions(cJSON *root, cloud_store_item_t *item) {
+#if CONFIG_ENABLE_GHOSTSCRIPT
     if (!root || !item) return;
     cJSON *permissions = cJSON_GetObjectItemCaseSensitive(root, "permissions");
     if (!cJSON_IsArray(permissions)) return;
@@ -427,6 +428,10 @@ static void copy_script_permissions(cJSON *root, cloud_store_item_t *item) {
             item->script_permissions |= value;
         }
     }
+#else
+    (void)root;
+    (void)item;
+#endif
 }
 
 static const char *script_permission_name(uint32_t permission) {

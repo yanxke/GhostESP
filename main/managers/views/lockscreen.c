@@ -15,7 +15,9 @@
 #include "managers/views/nfc_view.h"
 #include "managers/views/subghz_view.h"
 #include "managers/views/badusb_view.h"
+#if CONFIG_ENABLE_GHOSTSCRIPT
 #include "managers/views/ghostscript_runner_view.h"
+#endif
 #include "managers/views/plugin_runner_view.h"
 #include "gui/gui_router.h"
 #include "esp_mac.h"
@@ -1265,9 +1267,14 @@ static void lockscreen_fav_launch(const char *name) {
         plugin_runner_set_app(name + 4); // launch the app itself
         target = &plugin_runner_view;
     } else if (strncasecmp(name, "gs:", 3) == 0) {
+#if CONFIG_ENABLE_GHOSTSCRIPT
         // GhostScript: run it in the runner view.
         ghostscript_runner_set_script(name + 3);
         target = &ghostscript_runner_view;
+#else
+        // GhostScript is not part of screenless/capture profiles.
+        target = &options_menu_view; opt_type = OT_Settings; is_options = true;
+#endif
     } else if (strncasecmp(name, "badusb:", 7) == 0) {
 #if defined(CONFIG_HAS_BADUSB) || defined(CONFIG_HAS_BADUSB_REMOTE)
         // Payload script: the view addresses payloads by bare name.

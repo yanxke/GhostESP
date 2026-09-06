@@ -11,6 +11,9 @@
 #include "esp_log.h"
 #include "esp_private/esp_gpio_reserve.h"
 #include "esp_vfs_fat.h"
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+#include "esp_littlefs.h"
+#endif
 #include "diskio_impl.h"
 #include "diskio_sdmmc.h"
 #include "vendor/drivers/CH422G.h"
@@ -523,13 +526,37 @@ static SemaphoreHandle_t sd_card_get_jit_mutex(void) {
     return s_sd_jit_mutex;
 }
 
+esp_err_t sd_card_storage_info(uint64_t *total, uint64_t *free_bytes) {
+    if (!total || !free_bytes) return ESP_ERR_INVALID_ARG;
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    size_t capacity = 0, used = 0;
+    esp_err_t ret = esp_littlefs_info("captures", &capacity, &used);
+    *total = capacity;
+    *free_bytes = capacity >= used ? capacity - used : 0;
+    return ret;
+#else
+    return esp_vfs_fat_info(SD_MOUNT_POINT, total, free_bytes);
+#endif
+}
+
+esp_err_t sd_card_format_internal_storage(void) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    if (sd_card_manager.is_initialized || pcap_is_capturing()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_littlefs_format("captures");
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
 static void sd_card_update_cached_stats(void) {
     if (!sd_card_manager.is_initialized) {
         s_cached_stats.valid = false;
         return;
     }
     uint64_t total_bytes = 0, free_bytes = 0;
-    esp_err_t ret = esp_vfs_fat_info("/mnt", &total_bytes, &free_bytes);
+    esp_err_t ret = sd_card_storage_info(&total_bytes, &free_bytes);
     if (ret == ESP_OK && total_bytes > 0) {
         uint64_t used_bytes = total_bytes - free_bytes;
         s_cached_stats.used_pct = (int)((used_bytes * 100) / total_bytes);
@@ -658,6 +685,37 @@ static void sdmmc_card_print_info(const sdmmc_card_t *card) {
 }
 
 esp_err_t sd_card_init(void) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  if (sd_card_manager.is_initialized) return ESP_OK;
+  const esp_vfs_littlefs_conf_t conf = {
+      .base_path = SD_MOUNT_POINT,
+      .partition_label = "captures",
+#ifdef CONFIG_CAPTURE_LITTLEFS_FORMAT_IF_FAILED
+      .format_if_mount_failed = true,
+#else
+      .format_if_mount_failed = false,
+#endif
+  };
+  esp_err_t mount_ret = esp_vfs_littlefs_register(&conf);
+  if (mount_ret != ESP_OK) {
+    ESP_LOGE(TAG, "LittleFS mount failed: %s; check captures partition and provisioning option",
+             esp_err_to_name(mount_ret));
+    return mount_ret;
+  }
+  sd_card_manager.card = NULL;
+  sd_card_manager.is_initialized = true;
+  s_mount_type = MOUNT_VIRTUAL;
+  mount_ret = sd_card_setup_directory_structure();
+  if (mount_ret != ESP_OK) {
+    esp_vfs_littlefs_unregister("captures");
+    sd_card_manager.is_initialized = false;
+    s_mount_type = MOUNT_NONE;
+    return mount_ret;
+  }
+  sd_card_update_cached_stats();
+  ESP_LOGI(TAG, "LittleFS capture storage mounted at " SD_MOUNT_POINT);
+  return ESP_OK;
+#endif
   esp_err_t ret = ESP_FAIL;
 
   ESP_LOGI(TAG, "sd_card_init: starting, free internal RAM: %d bytes", 
@@ -1225,6 +1283,10 @@ esp_err_t sd_card_init(void) {
 
 // mount sd just-in-time for short io, then unmount after
 esp_err_t sd_card_mount_for_flush(bool *display_was_suspended) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  if (display_was_suspended) *display_was_suspended = false;
+  return sd_card_init();
+#endif
   SemaphoreHandle_t jit_mutex = sd_card_get_jit_mutex();
 
   if (!s_sd_log_levels_tuned) {
@@ -1332,6 +1394,9 @@ esp_err_t sd_card_mount_for_flush(bool *display_was_suspended) {
 }
 
 void sd_card_unmount_after_flush(bool display_was_suspended) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  return; /* Flash storage stays mounted for open capture files. */
+#endif
   SemaphoreHandle_t jit_mutex = sd_card_get_jit_mutex();
   bool resume_display = false;
 
@@ -1365,6 +1430,9 @@ void sd_card_unmount_after_flush(bool display_was_suspended) {
 }
 
 bool sd_card_needs_jit_mount(void) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    return false;
+#endif
 #if defined(CONFIG_USE_C5_PARLIO_DISPLAY)
     return false;
 #endif
@@ -1381,6 +1449,9 @@ bool sd_card_needs_jit_mount(void) {
 }
 
 bool sd_card_uses_shared_display_spi(void) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    return false;
+#endif
     return is_shared_display_sd_spi();
 }
 
@@ -1416,6 +1487,15 @@ void sd_card_jit_end(bool display_was_suspended) {
 }
 
 void sd_card_unmount_with_context(sd_unmount_context_t context) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  if (context == SD_UNMOUNT_CONTEXT_JIT) return;
+  if (sd_card_manager.is_initialized && esp_vfs_littlefs_unregister("captures") == ESP_OK) {
+    sd_card_manager.is_initialized = false;
+    s_mount_type = MOUNT_NONE;
+    s_cached_stats.valid = false;
+  }
+  return;
+#endif
 #if defined(CONFIG_IS_S3TWATCH) || defined(CONFIG_IS_ATOMS3R)
   if (s_virtual_storage_mounted) {
     unmount_virtual_storage();
@@ -1714,6 +1794,11 @@ esp_err_t sd_card_create_directory(const char *path) {
   }
 
   if (sd_card_exists(path)) {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    /* LittleFS does not implement POSIX permission bits. */
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
+#endif
     if (!has_full_permissions(path)) {
       printf("Directory %s does not have full permissions. Deleting and "
              "recreating.\n",
@@ -2081,6 +2166,10 @@ read_error:
 }
 
 void sd_card_print_config() {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  printf("Storage: LittleFS, partition captures, mount point " SD_MOUNT_POINT "\n");
+  return;
+#endif
 #if defined(CONFIG_IS_S3TWATCH) || defined(CONFIG_IS_ATOMS3R)
   if (s_virtual_storage_mounted) {
     printf("Storage Configuration: Virtual Flash Storage\n");
@@ -2112,6 +2201,9 @@ void sd_card_print_config() {
 }
 
 bool sd_card_is_virtual_storage() {
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  return true;
+#endif
 #if defined(CONFIG_IS_S3TWATCH) || defined(CONFIG_IS_ATOMS3R)
   return s_virtual_storage_mounted;
 #else

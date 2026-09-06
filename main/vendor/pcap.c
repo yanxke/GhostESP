@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 #define RADIOTAP_HEADER_LEN 8
 
@@ -41,9 +42,20 @@ static volatile pcap_mode_t s_pcap_mode = PCAP_MODE_FILE;
 static uint8_t *pcap_buffer = NULL;
 static size_t buffer_offset = 0;
 static FILE *pcap_file = NULL;
+static bool s_file_write_failed = false;
 static SemaphoreHandle_t pcap_mutex = NULL;
 static volatile bool s_capture_active = false;
 static pcap_capture_stats_t s_capture_stats;
+
+static int pcap_sync_file(FILE *file) {
+  if (fflush(file) != 0) return -1;
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  /* fflush only drains stdio; commit LittleFS metadata and data too. */
+  return fsync(fileno(file));
+#else
+  return 0;
+#endif
+}
 
 #define HCX_MAX_SSIDS 8
 #define HCX_MAX_M2 4
@@ -427,8 +439,7 @@ esp_err_t pcap_write_global_header(FILE *f, pcap_capture_type_t capture_type) {
     }
   } else {
     size_t written = fwrite(&header, 1, sizeof(header), f);
-    if (written == sizeof(header)) {
-      fflush(f);
+    if (written == sizeof(header) && pcap_sync_file(f) == 0) {
       return ESP_OK;
     }
     return ESP_FAIL;
@@ -498,6 +509,7 @@ esp_err_t pcap_file_open_in_dir(const char *base_file_name,
 
   buffer_offset = 0;
   s_capture_active = false;
+  s_file_write_failed = false;
   memset(&s_capture_stats, 0, sizeof(s_capture_stats));
   struct timeval start_tv;
   gettimeofday(&start_tv, NULL);
@@ -508,7 +520,7 @@ esp_err_t pcap_file_open_in_dir(const char *base_file_name,
     get_next_pcap_file_name(file_name, pcap_dir_path, pcap_base_name);
     pcap_file = fopen(file_name, "wb");
     if (!pcap_file) {
-      ESP_LOGW(PCAP_TAG, "PCAP file is not open, will flush to serial");
+      ESP_LOGW(PCAP_TAG, "Unable to open capture file");
     }
     if (file_name[0] != '\0') {
       strncpy(pcap_file_path, file_name, sizeof(pcap_file_path) - 1);
@@ -516,6 +528,13 @@ esp_err_t pcap_file_open_in_dir(const char *base_file_name,
     }
   }
 
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+  if (!pcap_file) {
+    ESP_LOGE(PCAP_TAG, "LittleFS capture file unavailable; capture not started");
+    xSemaphoreGive(pcap_mutex);
+    return ESP_FAIL;
+  }
+#endif
   esp_err_t ret = pcap_write_global_header(pcap_file, capture_type);
   if (ret != ESP_OK) {
     ESP_LOGE(PCAP_TAG, "Failed to write PCAP global header.");
@@ -531,7 +550,7 @@ esp_err_t pcap_file_open_in_dir(const char *base_file_name,
     ESP_LOGI(PCAP_TAG, "PCAP file %s opened and global header written.",
              file_name);
     if (pcap_file != NULL) {
-      glog("PCAP: saving to SD as %s\n", file_name);
+      glog("PCAP: saving to %s as %s\n", sd_card_is_virtual_storage() ? "flash" : "SD", file_name);
     } else {
       glog("PCAP: streaming over UART (SD open failed)\n");
     }
@@ -775,6 +794,11 @@ esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
   }
 
   size_t actual_length;
+  if (s_file_write_failed && s_pcap_mode == PCAP_MODE_FILE) {
+    s_capture_stats.packets_dropped++;
+    xSemaphoreGive(pcap_mutex);
+    return ESP_FAIL;
+  }
   size_t header_length = 0;
   uint8_t bt_h4_header[1];
   int is_bt = 0;
@@ -953,14 +977,20 @@ static esp_err_t _pcap_flush_wireshark_stream_nolock() {
 }
 
 static esp_err_t _pcap_flush_buffer_to_file_nolock() {
+  if (s_file_write_failed) {
+    buffer_offset = 0;
+    return ESP_FAIL;
+  }
   if (buffer_offset > 0) {
     s_capture_stats.buffer_flushes++;
     if (pcap_file) { // If file is open, write to file
       size_t written = fwrite(pcap_buffer, 1, buffer_offset, pcap_file);
-      if (written < buffer_offset) {
+      if (written < buffer_offset || pcap_sync_file(pcap_file) != 0) {
         ESP_LOGE(PCAP_TAG, "Failed to write buffered data to PCAP file.");
-      } else {
-        fflush(pcap_file);
+        glog("PCAP storage write failed (full or I/O error); stop capture and retrieve the partial file.\n");
+        s_file_write_failed = true;
+        buffer_offset = 0; /* Do not replay a partially written PCAP record. */
+        return ESP_FAIL;
       }
     } else { // If no file, try JIT mount for somethingsomething, else UART
       bool gating_template = pcap_is_jit_template();
@@ -1031,12 +1061,14 @@ esp_err_t pcap_flush_buffer_to_file() {
     return ESP_OK;
   }
   if (xSemaphoreTake(pcap_mutex, portMAX_DELAY)) {
+    esp_err_t ret;
     if (s_pcap_mode == PCAP_MODE_WIRESHARK) {
-      _pcap_flush_wireshark_stream_nolock();
+      ret = _pcap_flush_wireshark_stream_nolock();
     } else {
-      _pcap_flush_buffer_to_file_nolock();
+      ret = _pcap_flush_buffer_to_file_nolock();
     }
     xSemaphoreGive(pcap_mutex);
+    return ret;
   }
   return ESP_OK;
 }
@@ -1099,10 +1131,12 @@ void pcap_file_close() {
       gettimeofday(&stop_tv, NULL);
       s_capture_stats.stopped_us = (uint64_t)stop_tv.tv_sec * 1000000ULL +
                                    (uint64_t)stop_tv.tv_usec;
-      fclose(pcap_file);
+      if (fclose(pcap_file) != 0) s_file_write_failed = true;
       pcap_file = NULL;
       ESP_LOGI(PCAP_TAG, "PCAP file closed.");
-      if (pcap_file_path[0] != '\0') {
+      if (s_file_write_failed) {
+        toast_show("PCAP incomplete: storage error", TOAST_ERROR);
+      } else if (pcap_file_path[0] != '\0') {
         toast_show("PCAP saved", TOAST_SUCCESS);
         ghostchi_manager_add_xp(6);
       }

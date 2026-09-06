@@ -1,5 +1,25 @@
 menu "Ghost ESP Options"
 
+    menu "Capture storage"
+    config CAPTURE_STORAGE_LITTLEFS
+        bool "Use internal LittleFS instead of SD storage"
+        default n
+        help
+            Mount the 'captures' LittleFS partition at /mnt. All existing
+            capture paths and SD file commands use flash instead of a card.
+            Physical SD initialization is bypassed. Requires a partition table
+            containing a data,littlefs partition named captures.
+
+    config CAPTURE_LITTLEFS_FORMAT_IF_FAILED
+        bool "Format LittleFS if mounting fails (ERASES stored files)"
+        depends on CAPTURE_STORAGE_LITTLEFS
+        default n
+        help
+            Enable for initial provisioning of an empty partition, then turn
+            off. Any mount failure, including corruption, erases captures.
+
+    endmenu
+
     menu "Device Details"
 
     config BUILD_CONFIG_TEMPLATE

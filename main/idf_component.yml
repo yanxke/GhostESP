@@ -1,4 +1,5 @@
 dependencies:
+  joltwallet/littlefs: ^1.22.3
   espressif/cjson: ^1.7.19~1
   espressif/esp_lcd_axs15231b: ==1.0.0
   espressif/esp_io_expander_tca95xx_16bit: ^2.0.0

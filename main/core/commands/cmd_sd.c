@@ -3,7 +3,6 @@
 
 #include "core/commands.h"
 #include "core/glog.h"
-#include "esp_vfs_fat.h"
 #include "managers/sd_card_manager.h"
 #include "managers/status_display_manager.h"
 #include "sdkconfig.h"
@@ -153,6 +152,9 @@ void handle_sd_cmd(int argc, char **argv) {
     if (argc < 2) {
         glog("SD:USAGE\n");
         glog("  sd status                        - Show SD card status\n");
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+        glog("  sd format-littlefs ERASE         - Erase unmounted internal capture storage\n");
+#endif
         glog("  sd list [path]                   - List files/dirs with indices\n");
         glog("  sd info <idx|path>               - Show file/dir info\n");
         glog("  sd size <idx|path>               - Get file size\n");
@@ -167,6 +169,20 @@ void handle_sd_cmd(int argc, char **argv) {
 
     const char *sub = argv[1];
     char path[256];
+
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    if (strcmp(sub, "format-littlefs") == 0) {
+        if (argc != 3 || strcmp(argv[2], "ERASE") != 0) {
+            glog("This erases all internal capture files. Usage: sd format-littlefs ERASE\n");
+            return;
+        }
+        esp_err_t ret = sd_card_format_internal_storage();
+        if (ret == ESP_OK) ret = sd_card_init();
+        glog("LittleFS provisioning: %s (storage must be unmounted and captures stopped)\n",
+             esp_err_to_name(ret));
+        return;
+    }
+#endif
 
     if (strcmp(sub, "status") == 0) {
         if (!sd_cli_ensure_mounted()) {
@@ -185,7 +201,7 @@ void handle_sd_cmd(int argc, char **argv) {
             glog("SD:STATUS:capacity_mb=%llu\n", (unsigned long long)cap_mb);
         }
         uint64_t total = 0, free_bytes = 0;
-        if (esp_vfs_fat_info("/mnt", &total, &free_bytes) == ESP_OK && total > 0) {
+        if (sd_card_storage_info(&total, &free_bytes) == ESP_OK && total > 0) {
             glog("SD:STATUS:total=%llu\n", (unsigned long long)total);
             glog("SD:STATUS:free=%llu\n", (unsigned long long)free_bytes);
             glog("SD:STATUS:total_mb=%llu\n", (unsigned long long)(total / (1024 * 1024)));

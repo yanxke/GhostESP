@@ -1,4 +1,5 @@
 #include "managers/ap_manager.h"
+#include "managers/sd_card_manager.h"
 #include "managers/ghost_esp_site_gz.h"
 #define GHOST_SITE_PAYLOAD ghost_site_html_gz
 #define GHOST_SITE_PAYLOAD_SIZE ghost_site_html_gz_size
@@ -370,7 +371,7 @@ static esp_err_t api_sd_card_get_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(response_json, "path", path_param);
 
     uint64_t total_bytes = 0, free_bytes = 0;
-    esp_err_t ret = esp_vfs_fat_info("/mnt", &total_bytes, &free_bytes);
+    esp_err_t ret = sd_card_storage_info(&total_bytes, &free_bytes);
 
     if (ret == ESP_OK) {
         cJSON *storage_info = cJSON_CreateObject();

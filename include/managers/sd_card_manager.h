@@ -5,6 +5,7 @@
 #include "driver/sdmmc_types.h"
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 #define MAX_PORTALS 32
 #define MAX_PORTAL_NAME 64
@@ -79,6 +80,9 @@ esp_err_t sd_card_save_config();
 esp_err_t sd_card_load_config();
 void sd_card_print_config();
 bool sd_card_is_virtual_storage();
+esp_err_t sd_card_storage_info(uint64_t *total, uint64_t *free_bytes);
+/* Explicit provisioning only: refuses to format mounted or active storage. */
+esp_err_t sd_card_format_internal_storage(void);
 
 // mount sd just-in-time for short io, then unmount after
 esp_err_t sd_card_mount_for_flush(bool *display_was_suspended);
