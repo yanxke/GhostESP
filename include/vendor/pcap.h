@@ -31,7 +31,9 @@ typedef struct {
 
 #define MAX_FILE_NAME_LENGTH 128
 
-#if CONFIG_SPIRAM
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS) && CONFIG_SPIRAM
+#define PCAP_BUFFER_SIZE (512 * 1024)
+#elif CONFIG_SPIRAM
 #define PCAP_BUFFER_SIZE 8192
 #else
 #define PCAP_BUFFER_SIZE 5120
@@ -69,6 +71,7 @@ esp_err_t pcap_wireshark_start(pcap_capture_type_t capture_type);
 esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
                                       pcap_capture_type_t capture_type);
 esp_err_t pcap_flush_buffer_to_file();
+esp_err_t pcap_flush_buffer_to_file_durable();
 bool pcap_is_capturing(void);
 bool pcap_is_wireshark_mode(void);
 bool pcap_auto_flush_enabled(void);

@@ -31,7 +31,7 @@ static bool is_valid_beacon_fixed_params(const uint8_t *frame, size_t offset,
 esp_err_t pcap_file_open_in_dir(const char *base_file_name,
                                 const char *dir_path,
                                 pcap_capture_type_t capture_type);
-static esp_err_t _pcap_flush_buffer_to_file_nolock();
+static esp_err_t _pcap_flush_buffer_to_file_nolock(bool durable);
 static esp_err_t _pcap_flush_wireshark_stream_nolock();
 static void pcap_release_idle_resources(void);
 static char pcap_file_path[MAX_FILE_NAME_LENGTH];
@@ -47,12 +47,15 @@ static SemaphoreHandle_t pcap_mutex = NULL;
 static volatile bool s_capture_active = false;
 static pcap_capture_stats_t s_capture_stats;
 
-static int pcap_sync_file(FILE *file) {
+static int pcap_sync_file(FILE *file, bool durable) {
   if (fflush(file) != 0) return -1;
 #ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
-  /* fflush only drains stdio; commit LittleFS metadata and data too. */
-  return fsync(fileno(file));
+  /* LittleFS commits through stdio flush/close.  Descriptor-level fsync is
+   * not reliable on this ESP32-C5 VFS, even when RX is paused. */
+  (void)durable;
+  return 0;
 #else
+  (void)durable;
   return 0;
 #endif
 }
@@ -439,7 +442,7 @@ esp_err_t pcap_write_global_header(FILE *f, pcap_capture_type_t capture_type) {
     }
   } else {
     size_t written = fwrite(&header, 1, sizeof(header), f);
-    if (written == sizeof(header) && pcap_sync_file(f) == 0) {
+    if (written == sizeof(header) && pcap_sync_file(f, false) == 0) {
       return ESP_OK;
     }
     return ESP_FAIL;
@@ -877,13 +880,23 @@ esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
   }
 
   if (buffer_offset + total_packet_size > PCAP_BUFFER_SIZE) {
-    esp_err_t ret = _pcap_flush_buffer_to_file_nolock();
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+    /* Do not write LittleFS while promiscuous Wi-Fi RX is active.  The C5
+     * can CPU-lock up when flash/VFS writes contend with the Wi-Fi path.
+     * The enlarged PSRAM buffer is committed by pcap_file_close() after
+     * monitor mode has been stopped. */
+    s_capture_stats.packets_dropped++;
+    xSemaphoreGive(pcap_mutex);
+    return ESP_ERR_NO_MEM;
+#else
+    esp_err_t ret = _pcap_flush_buffer_to_file_nolock(false);
     if (ret != ESP_OK) {
       s_capture_stats.packets_dropped++;
       xSemaphoreGive(pcap_mutex);
       ESP_LOGE(PCAP_TAG, "Buffer flush failed");
       return ret;
     }
+#endif
   }
 
   // Write packet header
@@ -976,7 +989,7 @@ static esp_err_t _pcap_flush_wireshark_stream_nolock() {
   return ESP_OK;
 }
 
-static esp_err_t _pcap_flush_buffer_to_file_nolock() {
+static esp_err_t _pcap_flush_buffer_to_file_nolock(bool durable) {
   if (s_file_write_failed) {
     buffer_offset = 0;
     return ESP_FAIL;
@@ -985,13 +998,34 @@ static esp_err_t _pcap_flush_buffer_to_file_nolock() {
     s_capture_stats.buffer_flushes++;
     if (pcap_file) { // If file is open, write to file
       size_t written = fwrite(pcap_buffer, 1, buffer_offset, pcap_file);
-      if (written < buffer_offset || pcap_sync_file(pcap_file) != 0) {
+      if (written < buffer_offset || pcap_sync_file(pcap_file, durable) != 0) {
         ESP_LOGE(PCAP_TAG, "Failed to write buffered data to PCAP file.");
         glog("PCAP storage write failed (full or I/O error); stop capture and retrieve the partial file.\n");
         s_file_write_failed = true;
         buffer_offset = 0; /* Do not replay a partially written PCAP record. */
         return ESP_FAIL;
       }
+#ifdef CONFIG_CAPTURE_STORAGE_LITTLEFS
+      if (durable) {
+        /* Close commits the LittleFS metadata.  Reopen in append mode so the
+         * capture can continue without keeping a large uncommitted interval. */
+        if (fclose(pcap_file) != 0) {
+          ESP_LOGE(PCAP_TAG, "Failed to close PCAP file during durable flush.");
+          pcap_file = NULL;
+          s_file_write_failed = true;
+          buffer_offset = 0;
+          return ESP_FAIL;
+        }
+        pcap_file = NULL;
+        pcap_file = fopen(pcap_file_path, "ab");
+        if (pcap_file == NULL) {
+          ESP_LOGE(PCAP_TAG, "Failed to reopen PCAP file after durable flush.");
+          s_file_write_failed = true;
+          buffer_offset = 0;
+          return ESP_FAIL;
+        }
+      }
+#endif
     } else { // If no file, try JIT mount for somethingsomething, else UART
       bool gating_template = pcap_is_jit_template();
 
@@ -1065,7 +1099,24 @@ esp_err_t pcap_flush_buffer_to_file() {
     if (s_pcap_mode == PCAP_MODE_WIRESHARK) {
       ret = _pcap_flush_wireshark_stream_nolock();
     } else {
-      ret = _pcap_flush_buffer_to_file_nolock();
+      ret = _pcap_flush_buffer_to_file_nolock(false);
+    }
+    xSemaphoreGive(pcap_mutex);
+    return ret;
+  }
+  return ESP_OK;
+}
+
+esp_err_t pcap_flush_buffer_to_file_durable() {
+  if (pcap_mutex == NULL) {
+    return ESP_OK;
+  }
+  if (xSemaphoreTake(pcap_mutex, portMAX_DELAY)) {
+    esp_err_t ret;
+    if (s_pcap_mode == PCAP_MODE_WIRESHARK) {
+      ret = _pcap_flush_wireshark_stream_nolock();
+    } else {
+      ret = _pcap_flush_buffer_to_file_nolock(true);
     }
     xSemaphoreGive(pcap_mutex);
     return ret;
@@ -1123,7 +1174,7 @@ void pcap_file_close() {
   if (xSemaphoreTake(pcap_mutex, portMAX_DELAY) == pdTRUE) {
     if (buffer_offset > 0) {
       ESP_LOGI(PCAP_TAG, "Flushing remaining buffer before closing.");
-      _pcap_flush_buffer_to_file_nolock();
+      _pcap_flush_buffer_to_file_nolock(true);
     }
 
     if (pcap_file != NULL) {

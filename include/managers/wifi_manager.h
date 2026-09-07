@@ -214,6 +214,13 @@ void wifi_manager_stop_visualizer(void);
 void wifi_manager_stop_monitor_mode();
 
 void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback);
+void wifi_manager_start_monitor_mode_on_channel(wifi_promiscuous_cb_t_t callback,
+                                                uint8_t channel);
+
+/* Temporarily pause/resume promiscuous RX so storage can be accessed safely
+ * on ESP32-C5 during an active PCAP capture. */
+esp_err_t wifi_manager_pause_monitor_rx_for_storage(void);
+esp_err_t wifi_manager_resume_monitor_rx_after_storage(void);
 
 void wifi_manager_list_stations();
 

@@ -199,24 +199,17 @@ void handle_capture_scan(int argc, char **argv) {
         return;
     }
 
-    // Helper macro: after starting monitor mode, lock to fixed_channel if asked.
-    // Failure to lock is surfaced as an error and we tear the capture back down,
-    // matching the existing -wireshark behavior.
-#define APPLY_CAPTURE_CHANNEL_LOCK()                                          \
-    do {                                                                      \
-        if (fixed_channel_set) {                                              \
-            esp_err_t _lock_err =                                             \
-                wifi_manager_set_capture_channel_lock(fixed_channel);         \
-            if (_lock_err != ESP_OK) {                                        \
-                glog("Error: Failed to lock capture to channel %d\n",         \
-                     fixed_channel);                                          \
-                status_display_show_status("Channel Err");                    \
-                pcap_file_close();                                            \
-                wifi_manager_stop_monitor_mode();                             \
-                return;                                                       \
-            }                                                                 \
+    // Select a fixed channel before enabling promiscuous RX.  The ESP32-C5
+    // can CPU-lock up if the channel is changed after the RX callback starts.
+#define START_CAPTURE_MONITOR(_callback)                                      \
+    do {                                                                       \
+        if (fixed_channel_set) {                                               \
+            wifi_manager_start_monitor_mode_on_channel((_callback),            \
+                                                        fixed_channel);         \
             glog("Capture locked to channel %d\n", fixed_channel);            \
-        }                                                                     \
+        } else {                                                               \
+            wifi_manager_start_monitor_mode((_callback));                      \
+        }                                                                      \
     } while (0)
 
     if (strcmp(capturetype, "-probe") == 0) {
@@ -228,8 +221,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_probe_scan_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_probe_scan_callback);
         status_display_show_status("Capture Probe");
     }
 
@@ -241,8 +233,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_deauth_scan_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_deauth_scan_callback);
         status_display_show_status("Capture Deauth");
     }
 
@@ -255,8 +246,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_beacon_scan_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_beacon_scan_callback);
         status_display_show_status("Capture Beacon");
     }
 
@@ -269,8 +259,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_raw_scan_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_raw_scan_callback);
         status_display_show_status("Capture Raw");
     }
 
@@ -313,8 +302,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_eapol_scan_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_eapol_scan_callback);
         status_display_show_status("Capture EAPOL");
     }
 
@@ -327,8 +315,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_pwn_scan_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_pwn_scan_callback);
         status_display_show_status("Capture PWN");
     }
 
@@ -343,8 +330,7 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("PCAP Fail");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_wps_detection_callback);
-        APPLY_CAPTURE_CHANNEL_LOCK();
+        START_CAPTURE_MONITOR(wifi_wps_detection_callback);
         status_display_show_status("Capture WPS");
     }
 
@@ -355,19 +341,12 @@ void handle_capture_scan(int argc, char **argv) {
             status_display_show_status("Wireshark Err");
             return;
         }
-        wifi_manager_start_monitor_mode(wifi_raw_scan_callback);
-
         if (fixed_channel_set) {
-            err = wifi_manager_set_wireshark_fixed_channel(fixed_channel);
-            if (err != ESP_OK) {
-                glog("Error: Failed to set fixed channel %d\n", fixed_channel);
-                status_display_show_status("Channel Err");
-                pcap_wireshark_stop();
-                wifi_manager_stop_monitor_mode();
-                return;
-            }
+            wifi_manager_start_monitor_mode_on_channel(wifi_raw_scan_callback,
+                                                       fixed_channel);
             glog("Wireshark capture locked to channel %d\n", fixed_channel);
         } else {
+            wifi_manager_start_monitor_mode(wifi_raw_scan_callback);
             wifi_manager_start_wireshark_channel_hop();
         }
     }
@@ -455,7 +434,7 @@ void handle_capture_scan(int argc, char **argv) {
         status_display_show_status("Capture Unknown");
     }
 
-#undef APPLY_CAPTURE_CHANNEL_LOCK
+#undef START_CAPTURE_MONITOR
 }
 
 void handle_capture(int argc, char **argv) {

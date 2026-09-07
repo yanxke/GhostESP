@@ -157,12 +157,53 @@ static esp_timer_handle_t wifi_reconnect_timer = NULL;
 static int wifi_reconnect_count = 0;
 static volatile bool wifi_driver_started = false;
 static volatile bool wifi_monitor_capture_active = false;
+static volatile bool wifi_monitor_rx_paused_for_storage = false;
+static volatile bool wifi_monitor_rx_pause_requested = false;
+static volatile uint32_t wifi_monitor_rx_callbacks_active = 0;
+static wifi_promiscuous_cb_t_t wifi_monitor_capture_callback = NULL;
+static bool wifi_monitor_capture_fixed_channel = false;
+static wifi_promiscuous_cb_t_t wifi_monitor_storage_resume_callback = NULL;
+static uint8_t wifi_monitor_storage_resume_channel = 1;
 static volatile bool wifi_timed_scan_active = false;
 #define WIFI_MAX_RECONNECT_ATTEMPTS  5
 static volatile bool visualizer_stop_requested = false;
 static volatile int visualizer_socket = -1;
 static volatile bool ota_auto_check_running = false;
 static volatile bool ota_auto_check_done = false;
+
+/* Changing the primary channel while promiscuous RX is delivering frames can
+ * race the C5 Wi-Fi callback path.  Suspend RX around fixed-channel changes;
+ * the callback registration and hardware filter remain intact. */
+static esp_err_t wifi_set_capture_channel_safely(uint8_t channel,
+                                                 wifi_second_chan_t second);
+
+/* The ESP32-C5 Wi-Fi driver may invoke the promiscuous callback concurrently
+ * with the task that requests a callback/state change.  Keep the callback
+ * registered through this small fence so storage can wait for an in-flight
+ * callback to finish before touching the Wi-Fi RX state. */
+static void wifi_monitor_rx_trampoline(void *buf,
+                                       wifi_promiscuous_pkt_type_t type) {
+    __atomic_add_fetch(&wifi_monitor_rx_callbacks_active, 1, __ATOMIC_ACQUIRE);
+
+    if (wifi_monitor_capture_active && !wifi_monitor_rx_pause_requested &&
+        !wifi_monitor_rx_paused_for_storage &&
+        wifi_monitor_capture_callback != NULL) {
+        wifi_monitor_capture_callback(buf, type);
+    }
+
+    __atomic_sub_fetch(&wifi_monitor_rx_callbacks_active, 1, __ATOMIC_RELEASE);
+}
+
+static bool wifi_monitor_wait_for_callbacks(uint32_t timeout_ms) {
+    int64_t deadline = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+    while (__atomic_load_n(&wifi_monitor_rx_callbacks_active, __ATOMIC_ACQUIRE) != 0) {
+        if (esp_timer_get_time() >= deadline) {
+            return false;
+        }
+        vTaskDelay(1);
+    }
+    return true;
+}
 
 static bool karma_portal_active = false;
 
@@ -2330,9 +2371,16 @@ void wifi_manager_clear_scan_results(void) {
     ap_scan_clear_results();
 }
 
-void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback) {
+static void wifi_manager_start_monitor_mode_internal(wifi_promiscuous_cb_t_t callback,
+                                                      bool fixed_channel,
+                                                      uint8_t capture_channel) {
     if (wardriving_is_running()) stop_wardriving();
     wifi_monitor_capture_active = true;
+    wifi_monitor_rx_paused_for_storage = false;
+    wifi_monitor_rx_pause_requested = false;
+    __atomic_store_n(&wifi_monitor_rx_callbacks_active, 0, __ATOMIC_RELEASE);
+    wifi_monitor_capture_callback = callback;
+    wifi_monitor_capture_fixed_channel = fixed_channel;
     wifi_reconnect_reset();
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -2345,6 +2393,21 @@ void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback) {
     esp_wifi_disconnect();
 
     apply_selected_ap_capture_channel_plan(callback);
+
+    /* Select a fixed channel before promiscuous RX starts.  On ESP32-C5,
+     * changing channels while the RX callback is active can CPU-lock up. */
+    if (fixed_channel) {
+        wifi_manager_stop_wireshark_channel_hop();
+        esp_err_t channel_err = esp_wifi_set_channel(capture_channel,
+                                                     WIFI_SECOND_CHAN_NONE);
+        ESP_ERROR_CHECK(channel_err);
+    }
+
+    /* Do all heap allocation and task creation outside the Wi-Fi RX callback.
+     * The callback runs in a constrained driver context on ESP32-C5. */
+    if (pcap_is_capturing()) {
+        pcap_prepare_capture_queue();
+    }
 
     // Set hardware-level promiscuous filter based on callback type
     wifi_promiscuous_filter_t filter = {0};
@@ -2390,7 +2453,7 @@ void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback) {
         }
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(callback));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_monitor_rx_trampoline));
 
     const char *cap_desc = "monitor";
     if (callback == wifi_eapol_scan_callback) cap_desc = "EAPOL";
@@ -2421,11 +2484,26 @@ void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback) {
     }
     status_display_show_status("Monitor Started");
 }
+
+void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback) {
+    wifi_manager_start_monitor_mode_internal(callback, false, 0);
+}
+
+void wifi_manager_start_monitor_mode_on_channel(wifi_promiscuous_cb_t_t callback,
+                                                uint8_t channel) {
+    wifi_manager_start_monitor_mode_internal(callback, true, channel);
+}
 void wifi_manager_stop_monitor_mode() {
     // The active wardrive backend also owns this radio and its result list.
     // Fence its worker before releasing shared monitor tables or changing mode.
     if (wardriving_is_running()) stop_wardriving();
     wifi_monitor_capture_active = false;
+    wifi_monitor_rx_pause_requested = true;
+    wifi_monitor_rx_paused_for_storage = false;
+
+    if (!wifi_monitor_wait_for_callbacks(1000)) {
+        ESP_LOGW("WIFI_MANAGER", "Timed out waiting for monitor callback to finish");
+    }
 
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t wifi_status = esp_wifi_get_mode(&mode);
@@ -2442,6 +2520,8 @@ void wifi_manager_stop_monitor_mode() {
 
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(NULL));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
+    wifi_monitor_rx_pause_requested = false;
+    wifi_monitor_capture_callback = NULL;
     status_display_show_status("Monitor Stopped");
 
     // Stop ALL channel hopping timers
@@ -2463,6 +2543,63 @@ void wifi_manager_stop_monitor_mode() {
     // Promiscuous delivery is off and hoppers are stopped above: safe to
     // release the heap-on-demand monitor tables (recreated next session).
     wifi_callbacks_monitor_tables_release();
+}
+
+esp_err_t wifi_manager_pause_monitor_rx_for_storage(void) {
+    if (!wifi_monitor_capture_active || wifi_monitor_rx_paused_for_storage) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Save enough state to recreate the monitor after the storage barrier. */
+    wifi_monitor_storage_resume_callback = wifi_monitor_capture_callback;
+    wifi_monitor_storage_resume_channel = 1;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    (void)esp_wifi_get_channel(&wifi_monitor_storage_resume_channel, &second);
+    bool resume_fixed_channel = wifi_monitor_capture_fixed_channel;
+
+    /* Stop new callback work, then fence any callback already running before
+     * using the proven normal monitor-stop sequence. */
+    wifi_monitor_rx_pause_requested = true;
+    if (!wifi_monitor_wait_for_callbacks(1000)) {
+        wifi_monitor_rx_pause_requested = false;
+        wifi_monitor_storage_resume_callback = NULL;
+        return ESP_ERR_TIMEOUT;
+    }
+
+    wifi_manager_stop_monitor_mode();
+    if (wifi_monitor_capture_active || wifi_monitor_storage_resume_callback == NULL) {
+        wifi_monitor_rx_pause_requested = false;
+        wifi_monitor_storage_resume_callback = NULL;
+        return ESP_FAIL;
+    }
+
+    wifi_monitor_capture_fixed_channel = resume_fixed_channel;
+    wifi_monitor_capture_active = true;
+    wifi_monitor_rx_paused_for_storage = true;
+    wifi_monitor_rx_pause_requested = false;
+    glog("PCAP pause: monitor stopped for storage\n");
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_resume_monitor_rx_after_storage(void) {
+    if (!wifi_monitor_capture_active || !wifi_monitor_rx_paused_for_storage) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_promiscuous_cb_t_t callback = wifi_monitor_storage_resume_callback;
+    uint8_t channel = wifi_monitor_storage_resume_channel;
+    bool fixed_channel = wifi_monitor_capture_fixed_channel;
+    if (fixed_channel) {
+        wifi_manager_start_monitor_mode_on_channel(callback, channel);
+    } else {
+        wifi_manager_start_monitor_mode(callback);
+    }
+
+    wifi_monitor_rx_paused_for_storage = false;
+    wifi_monitor_rx_pause_requested = false;
+    wifi_monitor_storage_resume_callback = NULL;
+    glog("PCAP resume: callbacks enabled\n");
+    return ESP_OK;
 }
 
 void wifi_manager_init(void) {
@@ -4501,7 +4638,7 @@ esp_err_t wifi_manager_set_wireshark_fixed_channel(uint8_t channel) {
     wifi_manager_stop_wireshark_channel_hop();
 
     // Set the fixed channel
-    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t err = wifi_set_capture_channel_safely(channel, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set channel %d: %s", channel, esp_err_to_name(err));
         return err;
@@ -4532,7 +4669,7 @@ esp_err_t wifi_manager_set_capture_channel_lock(uint8_t channel) {
         airspace_monitor_stop();
     }
 
-    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t err = wifi_set_capture_channel_safely(channel, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to lock capture to channel %d: %s", channel, esp_err_to_name(err));
         return err;
@@ -4540,6 +4677,36 @@ esp_err_t wifi_manager_set_capture_channel_lock(uint8_t channel) {
 
     ESP_LOGI(TAG, "Capture locked to channel %d", channel);
     return ESP_OK;
+}
+
+static esp_err_t wifi_set_capture_channel_safely(uint8_t channel,
+                                                 wifi_second_chan_t second) {
+    bool promiscuous = false;
+    esp_err_t state_err = esp_wifi_get_promiscuous(&promiscuous);
+    bool suspend_rx = wifi_monitor_capture_active &&
+                      state_err == ESP_OK && promiscuous;
+
+    if (suspend_rx) {
+        esp_err_t disable_err = esp_wifi_set_promiscuous(false);
+        if (disable_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to suspend promiscuous RX before channel %d: %s",
+                     channel, esp_err_to_name(disable_err));
+            return disable_err;
+        }
+    }
+
+    esp_err_t channel_err = esp_wifi_set_channel(channel, second);
+
+    if (suspend_rx) {
+        esp_err_t enable_err = esp_wifi_set_promiscuous(true);
+        if (channel_err == ESP_OK && enable_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to resume promiscuous RX on channel %d: %s",
+                     channel, esp_err_to_name(enable_err));
+            channel_err = enable_err;
+        }
+    }
+
+    return channel_err;
 }
 
 // Start station scan - delegated to station_scan module

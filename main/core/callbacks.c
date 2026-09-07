@@ -1482,6 +1482,13 @@ static pcap_pool_slot_t *s_pcap_pool = NULL;
 static size_t s_pcap_pool_slots = 0;
 static portMUX_TYPE s_pcap_pool_lock = portMUX_INITIALIZER_UNLOCKED;
 
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+#define PCAP_LITTLEFS_FLUSH_INTERVAL_US (120ULL * 1000000ULL)
+static volatile bool s_pcap_periodic_flush_due = false;
+static volatile bool s_pcap_periodic_flush_clear_pending = false;
+#endif
+static volatile bool s_pcap_writer_processing = false;
+
 static bool pcap_pool_init(void) {
     if (s_pcap_pool != NULL && s_pcap_pool_slots > 0) {
         return true;
@@ -1543,32 +1550,70 @@ static void pcap_pool_release_slot(uint8_t slot_idx) {
     taskEXIT_CRITICAL(&s_pcap_pool_lock);
 }
 
+static bool pcap_writer_process_item(const pcap_q_item_t *item) {
+    if (!item || s_pcap_pool == NULL || item->slot_idx >= s_pcap_pool_slots) {
+        return false;
+    }
+
+    pcap_pool_slot_t *slot = &s_pcap_pool[item->slot_idx];
+    bool processed = slot->length > 0;
+    s_pcap_writer_processing = true;
+    if (processed) {
+        pcap_write_packet_to_buffer(slot->data, slot->length, item->cap_type);
+    }
+    pcap_pool_release_slot(item->slot_idx);
+    s_pcap_writer_processing = false;
+    return processed;
+}
+
 static void pcap_writer_task(void *arg) {
     (void)arg;
     pcap_q_item_t item;
     uint32_t processed = 0;
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+    int64_t last_flush_us = esp_timer_get_time();
+    bool packets_since_flush = false;
+#endif
     for (;;) {
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+        if (s_pcap_periodic_flush_clear_pending) {
+            packets_since_flush = false;
+            s_pcap_periodic_flush_clear_pending = false;
+        }
+#endif
         if (xQueueReceive(s_pcap_q, &item, pdMS_TO_TICKS(500)) == pdTRUE) {
-            if (s_pcap_pool != NULL && item.slot_idx < s_pcap_pool_slots) {
-                pcap_pool_slot_t *slot = &s_pcap_pool[item.slot_idx];
-                if (slot->length > 0) {
-                    pcap_write_packet_to_buffer(slot->data, slot->length, item.cap_type);
-                }
-                pcap_pool_release_slot(item.slot_idx);
-            }
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+            packets_since_flush |= pcap_writer_process_item(&item);
+#else
+            pcap_writer_process_item(&item);
+#endif
             processed++;
             if ((processed & 0xFF) == 0) { // log occasionally to avoid spam
                 UBaseType_t hwm_words = uxTaskGetStackHighWaterMark(NULL);
                 glog("PCAP writer HWM (bytes): %lu\n", (unsigned long)hwm_words);
             }
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+            /* LittleFS must only be touched while promiscuous RX is paused.
+             * Check this after packet activity, so idle captures do not flush. */
+            int64_t now_us = esp_timer_get_time();
+            if (packets_since_flush && !pcap_is_wireshark_mode() &&
+                pcap_auto_flush_enabled() &&
+                now_us - last_flush_us >= PCAP_LITTLEFS_FLUSH_INTERVAL_US) {
+                last_flush_us = now_us; /* Enforce the minimum attempt interval. */
+                s_pcap_periodic_flush_due = true;
+            }
+#else
             if ((processed & 0x1F) == 0 && pcap_auto_flush_enabled()) {
                 pcap_flush_buffer_to_file();
             }
+#endif
         } else {
-            // periodic flush even if idle
+            // Non-LittleFS modes retain their existing idle flush behavior.
+#if !defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
             if (pcap_auto_flush_enabled()) {
                 pcap_flush_buffer_to_file();
             }
+#endif
         }
     }
 }
@@ -1584,8 +1629,70 @@ static inline void ensure_pcap_queue_started(void) {
 
     s_pcap_q = xQueueCreate(EAPOL_Q_LEN, sizeof(pcap_q_item_t));
     if (s_pcap_q != NULL && s_pcap_writer_task == NULL) {
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+        s_pcap_periodic_flush_due = false;
+        s_pcap_periodic_flush_clear_pending = false;
+#endif
         xTaskCreate_psram(pcap_writer_task, "pcap_wr", 3072, NULL, 5, &s_pcap_writer_task);
     }
+}
+
+void pcap_prepare_capture_queue(void) {
+    ensure_pcap_queue_started();
+}
+
+void pcap_service_periodic_flush(void) {
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+    if (!s_pcap_periodic_flush_due || s_pcap_writer_task == NULL) {
+        return;
+    }
+
+    glog("PCAP periodic flush: pausing RX\n");
+    /* Do not tear down the Wi-Fi RX path while the writer is still using a
+     * packet-pool slot.  Manual capture stop normally arrives after this
+     * naturally, but the timer can fire at the busiest possible instant. */
+    int64_t idle_deadline = esp_timer_get_time() + 1000000LL;
+    while (s_pcap_writer_processing || uxQueueMessagesWaiting(s_pcap_q) != 0) {
+        if (esp_timer_get_time() >= idle_deadline) {
+            ESP_LOGW(TAG, "PCAP writer did not become idle before periodic flush");
+            return;
+        }
+        vTaskDelay(1);
+    }
+
+    /* The serial task owns the Wi-Fi stop/flush/resume sequence.  Suspend the
+     * packet writer while the driver is being stopped and while LittleFS is
+     * accessed, so no other task can touch the PCAP mutex or buffer during
+     * that transition. */
+    vTaskSuspend(s_pcap_writer_task);
+    esp_err_t pause_err = wifi_manager_pause_monitor_rx_for_storage();
+    if (pause_err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not pause Wi-Fi RX for PCAP flush: %s",
+                 esp_err_to_name(pause_err));
+        vTaskResume(s_pcap_writer_task);
+        return;
+    }
+
+    glog("PCAP periodic flush: RX quiesced\n");
+    esp_err_t flush_err = pcap_flush_buffer_to_file_durable();
+    glog("PCAP periodic flush: storage returned %d\n", (int)flush_err);
+    if (flush_err != ESP_OK) {
+        ESP_LOGW(TAG, "Periodic LittleFS PCAP flush failed: %s",
+                 esp_err_to_name(flush_err));
+    } else {
+        /* The writer owns the activity flag; clear it when it resumes so a
+         * quiet capture cannot cause another flush without new packets. */
+        s_pcap_periodic_flush_clear_pending = true;
+    }
+    s_pcap_periodic_flush_due = false;
+
+    esp_err_t resume_err = wifi_manager_resume_monitor_rx_after_storage();
+    if (resume_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to resume Wi-Fi RX after PCAP flush: %s",
+                 esp_err_to_name(resume_err));
+    }
+    vTaskResume(s_pcap_writer_task);
+#endif
 }
 
 static inline void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len, pcap_capture_type_t cap_type) {
@@ -1645,6 +1752,11 @@ void cleanup_pcap_queue(void) {
         vQueueDelete(s_pcap_q);
         s_pcap_q = NULL;
     }
+
+#if defined(CONFIG_CAPTURE_STORAGE_LITTLEFS)
+    s_pcap_periodic_flush_due = false;
+    s_pcap_periodic_flush_clear_pending = false;
+#endif
 
     if (s_pcap_pool != NULL) {
         pcap_pool_slot_t *pool_to_free = NULL;

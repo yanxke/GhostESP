@@ -1,4 +1,5 @@
 #include "core/serial_manager.h"
+#include "core/callbacks.h"
 #include "core/system_manager.h"
 #include "driver/uart.h"
 #include "core/glog.h"
@@ -701,6 +702,8 @@ void serial_task(void *pvParameter) {
 
   bool first_iteration = true;
   while (1) {
+    pcap_service_periodic_flush();
+
     // Ensure prompt is displayed on first iteration if it wasn't shown during init
     if (first_iteration && !s_uart_disabled && !prompt_displayed) {
       fflush(stdout);
